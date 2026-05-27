@@ -1,0 +1,7 @@
+config_local/
+data/
+outputs/
+__pycache__/
+*.pyc
+.DS_Store
+.env
