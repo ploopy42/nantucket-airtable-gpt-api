@@ -94,6 +94,69 @@ def normalize_address(value):
     return value
 
 
+def parse_money_to_float(value):
+    value = clean_text(value)
+
+    if not value:
+        return None
+
+    value = value.replace("$", "").replace(",", "").strip()
+
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def get_year_from_date(value):
+    value = clean_text(value)
+
+    if not value:
+        return None
+
+    # Handles YYYY-MM-DD
+    match = re.match(r"^(\d{4})-", value)
+    if match:
+        return int(match.group(1))
+
+    # Handles MM/DD/YYYY
+    match = re.match(r"^\d{1,2}/\d{1,2}/(\d{4})$", value)
+    if match:
+        return int(match.group(1))
+
+    return None
+
+
+INSTITUTIONAL_OWNER_NAMES = {
+    "NANTUCKET TOWN OF",
+    "NANTUCKET CONSERVATION FOUND I",
+    "NANTUCKET ISLANDS LAND BANK",
+}
+
+
+INSTITUTIONAL_OWNER_CATEGORIES = {
+    "Town / Government",
+    "Nantucket Conservation Foundation",
+    "Nantucket Islands Land Bank",
+}
+
+
+def is_institutional_or_excluded(fields):
+    owner_name = clean_text(fields.get("owner_name")).upper()
+    owner_category = clean_text(fields.get("owner_category"))
+
+    if fields.get("exclude_from_weekly_refresh"):
+        return True
+
+    if owner_name in INSTITUTIONAL_OWNER_NAMES:
+        return True
+
+    if owner_category in INSTITUTIONAL_OWNER_CATEGORIES:
+        return True
+
+    return False
+
+
 def property_summary(record):
     fields = record.get("fields", {})
 
@@ -237,6 +300,49 @@ class CreateManualEventRequest(BaseModel):
     notification_type: str = "Potential lead"
     requires_review: bool = True
     suggested_lead_status: str = "Potential listing"
+
+
+class QueryPropertiesRequest(BaseModel):
+    max_last_sale_price: Optional[float] = Field(
+        None,
+        description="Return properties with last_sale_price less than or equal to this value."
+    )
+    min_last_sale_price: Optional[float] = Field(
+        None,
+        description="Return properties with last_sale_price greater than or equal to this value."
+    )
+    sold_before_year: Optional[int] = Field(
+        None,
+        description="Return properties with last_sale_date before this year."
+    )
+    sold_after_year: Optional[int] = Field(
+        None,
+        description="Return properties with last_sale_date after this year."
+    )
+    owner_contains: Optional[str] = Field(
+        None,
+        description="Return properties whose owner_name contains this text."
+    )
+    address_contains: Optional[str] = Field(
+        None,
+        description="Return properties whose property_address contains this text."
+    )
+    zoning_code: Optional[str] = Field(
+        None,
+        description="Return properties with this zoning_code."
+    )
+    neighborhood: Optional[str] = Field(
+        None,
+        description="Return properties with this neighborhood."
+    )
+    exclude_institutional: bool = Field(
+        True,
+        description="Exclude Town, Land Bank, Conservation Foundation, and exclude_from_weekly_refresh records."
+    )
+    limit: int = Field(
+        50,
+        description="Maximum number of properties to return."
+    )
 
 
 # ============================================================
@@ -402,6 +508,106 @@ def create_manual_event(
         "property_event_record_id": created_event.get("id"),
         "task_record_id": created_task.get("id"),
         "message": "Manual event and notification task created in Airtable.",
+    }
+
+
+@app.post("/query-properties")
+def query_properties(
+    request: QueryPropertiesRequest,
+    x_api_key: Optional[str] = Header(None),
+):
+    require_api_key(x_api_key)
+
+    records = read_all_properties()
+    results = []
+
+    owner_contains_norm = clean_text(request.owner_contains).upper()
+    address_contains_norm = normalize_address(request.address_contains)
+    zoning_code_norm = clean_text(request.zoning_code).upper()
+    neighborhood_norm = clean_text(request.neighborhood).upper()
+
+    for record in records:
+        fields = record.get("fields", {})
+
+        if request.exclude_institutional and is_institutional_or_excluded(fields):
+            continue
+
+        property_address = clean_text(fields.get("property_address"))
+        owner_name = clean_text(fields.get("owner_name"))
+        last_sale_price_raw = clean_text(fields.get("last_sale_price"))
+        last_sale_date_raw = clean_text(fields.get("last_sale_date"))
+        zoning_code_raw = clean_text(fields.get("zoning_code"))
+        neighborhood_raw = clean_text(fields.get("neighborhood"))
+
+        last_sale_price = parse_money_to_float(last_sale_price_raw)
+        last_sale_year = get_year_from_date(last_sale_date_raw)
+
+        if request.max_last_sale_price is not None:
+            if last_sale_price is None or last_sale_price > request.max_last_sale_price:
+                continue
+
+        if request.min_last_sale_price is not None:
+            if last_sale_price is None or last_sale_price < request.min_last_sale_price:
+                continue
+
+        if request.sold_before_year is not None:
+            if last_sale_year is None or last_sale_year >= request.sold_before_year:
+                continue
+
+        if request.sold_after_year is not None:
+            if last_sale_year is None or last_sale_year <= request.sold_after_year:
+                continue
+
+        if owner_contains_norm:
+            if owner_contains_norm not in owner_name.upper():
+                continue
+
+        if address_contains_norm:
+            if address_contains_norm not in normalize_address(property_address):
+                continue
+
+        if zoning_code_norm:
+            if zoning_code_raw.upper() != zoning_code_norm:
+                continue
+
+        if neighborhood_norm:
+            if neighborhood_raw.upper() != neighborhood_norm:
+                continue
+
+        results.append({
+            "record_id": record.get("id"),
+            "pid": clean_text(fields.get("pid")),
+            "property_address": property_address,
+            "owner_name": owner_name,
+            "mailing_address": clean_text(fields.get("mailing_address")),
+            "last_sale_date": last_sale_date_raw,
+            "last_sale_price": last_sale_price_raw,
+            "last_sale_price_numeric": last_sale_price,
+            "zoning_code": zoning_code_raw,
+            "neighborhood": neighborhood_raw,
+            "mblu": clean_text(fields.get("mblu")),
+            "assessed_total_value": clean_text(fields.get("assessed_total_value")),
+            "lead_status": clean_text(fields.get("lead_status")),
+            "exclude_from_weekly_refresh": bool(fields.get("exclude_from_weekly_refresh")),
+            "owner_category": clean_text(fields.get("owner_category")),
+        })
+
+    # Useful default sorting for sale-price queries.
+    results = sorted(
+        results,
+        key=lambda x: (
+            x["last_sale_price_numeric"] is None,
+            x["last_sale_price_numeric"] if x["last_sale_price_numeric"] is not None else 999999999999,
+        )
+    )
+
+    limited_results = results[: max(1, min(request.limit, 200))]
+
+    return {
+        "total_matches": len(results),
+        "returned_count": len(limited_results),
+        "exclude_institutional": request.exclude_institutional,
+        "results": limited_results,
     }
 
 
